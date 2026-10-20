@@ -17,6 +17,12 @@ import SpeedPanel from "./SpeedPanel";
 import ProcessDetail from "./ProcessDetail";
 import { useSettings, useSpeed } from "../hooks/useSettings";
 import { getAcceleratedNames, addAcceleratedName, removeAcceleratedName } from "../store/process";
+import { useSnackbar } from "../contexts/SnackbarContext";
+
+// Auto-inject retry policy for processes that failed to inject (e.g. the game
+// was still starting up). Upstream never retried: the row stayed "on" forever.
+const RETRY_DELAY_MS = 3000;
+const MAX_AUTO_ATTEMPTS = 5;
 
 // ── Types & constants ────────────────────────────────────────────────────
 
@@ -278,6 +284,10 @@ export default function ProcessManager() {
   const [showSystem, setShowSystem] = useState(false);
   const { settings } = useSettings();
   const { speed, setSpeed, commitSpeed } = useSpeed();
+  const { t } = useTranslation();
+  const { notify } = useSnackbar();
+  // pid → failed attempts / time of last failure
+  const failures = useRef<Map<number, { count: number; last: number }>>(new Map());
 
   const gears = useMemo(() => settings
     ? [1, 2, 3, 4, 5].map(i => (settings[`gear${i}Speed` as keyof typeof settings] as number) || 1)
@@ -291,18 +301,50 @@ export default function ProcessManager() {
     return s;
   }, [speedMap]);
 
-  // Toggle — optimistic: set state immediately, fire backend call in background
+  function setPidState(pid: number, st: SpeedState | null) {
+    setSpeedMap(prev => {
+      const n = new Map(prev);
+      if (st) n.set(pid, st); else n.delete(pid);
+      return n;
+    });
+  }
+
+  // Inject + enable one PID. Optimistic "on" while the call runs (so the
+  // auto-inject loop does not fire a second attempt), then reflect the REAL
+  // result — upstream ignored it, so failures looked like successes.
+  async function injectPid(pid: number, arch: string, silent: boolean): Promise<boolean> {
+    setPidState(pid, { injected: true, enabled: true, arch });
+    let ok = false;
+    try {
+      ok = await invoke<boolean>("bridge_inject", { pid, arch });
+    } catch (e) {
+      console.error("[inject] bridge_inject error:", e);
+    }
+    if (ok) {
+      failures.current.delete(pid);
+    } else {
+      const f = failures.current.get(pid) ?? { count: 0, last: 0 };
+      failures.current.set(pid, { count: f.count + 1, last: Date.now() });
+      setPidState(pid, { injected: false, enabled: false, arch });
+      if (!silent) notify(`${t("process.injectFail")} (PID ${pid})`, "error", 5000);
+    }
+    return ok;
+  }
+
+  async function disablePid(pid: number, arch: string) {
+    setSpeedMap(prev => { const n = new Map(prev); const cur = n.get(pid); n.set(pid, { injected: cur?.injected ?? true, enabled: false, arch }); return n; });
+    let ok = false;
+    try { ok = await invoke<boolean>("bridge_disable", { pid, arch }); } catch { /* reported below */ }
+    if (!ok) notify(`${t("process.disableFail")} (PID ${pid})`, "warning", 4000);
+  }
+
   async function toggle(pid: number, arch: string) {
     const wasOn = speedMap.get(pid)?.enabled ?? false;
-
     if (!wasOn) {
-      setSpeedMap(prev => { const n = new Map(prev); n.set(pid, { injected: true, enabled: true, arch }); return n; });
-      invoke<boolean>("bridge_inject", { pid, arch })
-        .catch((e) => { console.error("[toggle] bridge_inject error:", e); });
+      failures.current.delete(pid); // manual click = fresh attempt budget
+      await injectPid(pid, arch, false);
     } else {
-      setSpeedMap(prev => { const n = new Map(prev); n.set(pid, { ...prev.get(pid)!, enabled: false }); return n; });
-      invoke<boolean>("bridge_disable", { pid, arch })
-        .catch(() => {});
+      await disablePid(pid, arch);
     }
   }
 
@@ -311,25 +353,42 @@ export default function ProcessManager() {
   useEffect(() => { if (search.trim()) { invoke<ProcessInfo[]>("get_process_list").then(setProcesses).catch(() => {}); } }, [search]);
   useInterval(async () => { try { setProcesses(await invoke<ProcessInfo[]>("get_process_list_fast")); } catch {} }, 1000);
 
-  // Periodically inject saved process names
+  // Forget PIDs that no longer exist — otherwise a new, unrelated process that
+  // reuses the PID would show up as "accelerated".
+  useEffect(() => {
+    if (processes.length === 0) return;
+    const alive = new Set(processes.map(p => p.pid));
+    setSpeedMap(prev => {
+      let changed = false;
+      const n = new Map(prev);
+      for (const pid of n.keys()) if (!alive.has(pid)) { n.delete(pid); changed = true; }
+      return changed ? n : prev;
+    });
+    for (const pid of failures.current.keys()) if (!alive.has(pid)) failures.current.delete(pid);
+  }, [processes]);
+
+  // Periodically inject saved process names (this is what re-attaches after the
+  // game is restarted with a new PID). Failed PIDs are retried with a delay, up
+  // to MAX_AUTO_ATTEMPTS times.
   useInterval(async () => {
     if (processes.length === 0) return;
     const names = await getAcceleratedNames();
+    const now = Date.now();
     for (const name of names) {
-      const procs = processes.filter(p =>
-        p.name.toLowerCase() === name.toLowerCase() && !speedMap.get(p.pid)?.enabled
-      );
-      if (procs.length === 0) continue;
-      const arch = procs[0].arch;
-      setSpeedMap(prev => {
-        const n = new Map(prev);
-        for (const p of procs) {
-          n.set(p.pid, { injected: true, enabled: true, arch });
-        }
-        return n;
+      const procs = processes.filter(p => {
+        if (p.name.toLowerCase() !== name.toLowerCase()) return false;
+        if (speedMap.get(p.pid)?.enabled) return false; // on, or attempt in flight
+        const f = failures.current.get(p.pid);
+        if (f && (f.count >= MAX_AUTO_ATTEMPTS || now - f.last < RETRY_DELAY_MS)) return false;
+        return true;
       });
       for (const p of procs) {
-        invoke<boolean>("bridge_inject", { pid: p.pid, arch }).catch(() => {});
+        injectPid(p.pid, p.arch, true).then(ok => {
+          const f = failures.current.get(p.pid);
+          if (!ok && f && f.count === MAX_AUTO_ATTEMPTS) {
+            notify(`${t("process.injectFail")} — ${p.name} (PID ${p.pid})`, "error", 6000);
+          }
+        });
       }
     }
   }, 1000);
@@ -370,22 +429,16 @@ export default function ProcessManager() {
   async function toggleName(name: string) {
     const group = nameGroups.get(name.toLowerCase());
     if (!group) return;
+    const procs = visibleProcesses.filter(p => p.name.toLowerCase() === name.toLowerCase());
     if (!group.anyEnabled) {
       addAcceleratedName(name);
-      for (const pid of group.pids) {
-        setSpeedMap(prev => { const n = new Map(prev); n.set(pid, { injected: true, enabled: true, arch: group.arch }); return n; });
-      }
-      for (const pid of group.pids) {
-        invoke<boolean>("bridge_inject", { pid, arch: group.arch }).catch(() => {});
+      for (const p of procs) {
+        failures.current.delete(p.pid);
+        injectPid(p.pid, p.arch, false);
       }
     } else {
       removeAcceleratedName(name);
-      for (const pid of group.pids) {
-        setSpeedMap(prev => { const n = new Map(prev); const cur = n.get(pid); if (cur) n.set(pid, { ...cur, enabled: false }); return n; });
-      }
-      for (const pid of group.pids) {
-        invoke<boolean>("bridge_disable", { pid, arch: group.arch }).catch(() => {});
-      }
+      for (const p of procs) disablePid(p.pid, p.arch);
     }
   }
 
@@ -414,7 +467,7 @@ export default function ProcessManager() {
         } else if (status === false) {
           setSpeedMap(prev => { const n = new Map(prev); n.set(p.pid, { injected: true, enabled: false, arch: p.arch }); return n; });
         }
-        // status === null means not injected — don't set anything
+        // status === null means not injected (or bridge unavailable) — leave as is
       })
       .catch(() => {});
   }, [selectedPid]);
