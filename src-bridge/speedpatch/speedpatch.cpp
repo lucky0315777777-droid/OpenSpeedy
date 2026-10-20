@@ -25,7 +25,10 @@
 #include <atomic>
 #include <mmsystem.h>
 #include <shared_mutex>
+#include <mutex>
+#include <cmath>
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "user32.lib")
 #pragma data_seg("shared")
 static std::atomic<double> factor = 1.0;
 // 安装失败的 hook 数。放在共享段里 —— 注入到游戏里的那份 DLL 记录到的失败
@@ -35,14 +38,16 @@ static std::atomic<unsigned> hookFailures = 0;
 #pragma comment(linker, "/section:shared,RWS")
 
 static std::shared_mutex mutex;
-static std::atomic<double> pre_factor = 1.0;
 static HANDLE hFileMap;
 static bool*  pEnabled;
 
-inline VOID shouldUpdateAll();
-
 SPEEDPATCH_API void SP_SetSpeed(double factor_)
 {
+    // 拒绝 0、负数、NaN、无穷大 —— 这些值会让时间停止或倒退，游戏直接卡死
+    if (!(factor_ > 0.0) || !std::isfinite(factor_))
+    {
+        return;
+    }
     factor.store(factor_);
 }
 
@@ -160,7 +165,9 @@ double SpeedFactor()
 {
     if (SP_IsEnabled())
     {
-        return factor.load();
+        double f = factor.load();
+        // 防呆：倍率非正数或 NaN 时当作 1.0，避免除以 0 / 时间倒退
+        return (f > 0.0) ? f : 1.0;
     }
     else
     {
@@ -168,13 +175,111 @@ double SpeedFactor()
     }
 }
 
+// ── 等待时间缩放 ─────────────────────────────────────────────────────────
+// 原版直接 dwMilliseconds / SpeedFactor()：
+//   * Sleep/SleepEx 没有排除 INFINITE —— 倍率 < 1 时结果超出 DWORD 范围（未定义行为，
+//     可能变成 0），原本应该永远等待的线程会立刻返回。
+//   * 大数值也可能溢出。
+// 这里统一处理：0 与 INFINITE 原样传递，其余按倍率缩放并夹在合法范围内。
+static DWORD ScaleTimeout(DWORD ms)
+{
+    if (ms == 0 || ms == INFINITE)
+    {
+        return ms;
+    }
+    double v = (double) ms / SpeedFactor();
+    if (v >= (double) (INFINITE - 1))
+    {
+        return INFINITE - 1;
+    }
+    return (DWORD) v;
+}
+
+// 同上，但结果至少为 1（timeSetEvent 的 uDelay 为 0 会直接失败、返回 NULL，
+// 导致游戏的多媒体计时器建立失败）。
+static UINT ScaleDelayMin1(UINT ms)
+{
+    if (ms == 0)
+    {
+        return 0;
+    }
+    DWORD v = ScaleTimeout(ms);
+    return v == 0 ? 1 : v;
+}
+
+// ── 线程安全的缩放时钟 ───────────────────────────────────────────────────
+// 原版每个时间函数用 4 个独立的 atomic（base/last × real/hook），倍率改变时由
+// 任意线程把 last 复制成 base。多线程下这几个值不是成对更新的：一个线程刚写了
+// lastReal、还没写 lastHook，另一个线程就拿它们当新基准 —— 游戏拿到的时间会
+// 突然往前跳或往回退。时间倒退会让很多游戏卡住或“加速失效”。
+//
+// 新做法：每个时钟一把 SRW 锁，在锁内读取真实时间，并且每次调用都以上一次的
+// 结果为基准累加：hook += factor × (now - lastReal)。小数部分累计在 frac 里，
+// 不会因为取整而越跑越慢。结果单调、可正确处理计数器回绕，倍率改变立即生效。
+template <typename T, typename D>
+struct ScaledClock
+{
+    SRWLOCK lock = SRWLOCK_INIT;
+    bool    init = false;
+    T       lastReal{};
+    T       lastHook{};
+    double  frac = 0.0;
+
+    template <typename F>
+    T Now(F readReal)
+    {
+        AcquireSRWLockExclusive(&lock);
+        T now = readReal();
+        if (!init)
+        {
+            lastReal = now;
+            lastHook = now;
+            frac     = 0.0;
+            init     = true;
+        }
+        // 用有号差值：GetMessageTime 返回的是“最后一条消息的时间”，可能比上次小
+        D elapsed     = (D) (now - lastReal);
+        double scaled = SpeedFactor() * (double) elapsed + frac;
+        double whole  = (scaled >= 0.0) ? floor(scaled) : ceil(scaled);
+        frac          = scaled - whole;
+        lastHook      = (T) (lastHook + (T) (D) whole);
+        lastReal      = now;
+        T result      = lastHook;
+        ReleaseSRWLockExclusive(&lock);
+        return result;
+    }
+};
+
+static ScaledClock<DWORD, LONG>         clk_TimeGetTime;
+static ScaledClock<DWORD, LONG>         clk_GetMessageTime;
+static ScaledClock<DWORD, LONG>         clk_GetTickCount;
+static ScaledClock<ULONGLONG, LONGLONG> clk_GetTickCount64;
+static ScaledClock<ULONGLONG, LONGLONG> clk_QueryPerformanceCounter;
+static ScaledClock<ULONGLONG, LONGLONG> clk_GetSystemTimeAsFileTime;
+static ScaledClock<ULONGLONG, LONGLONG> clk_GetSystemTimePreciseAsFileTime;
+
+static inline ULONGLONG FileTimeToU64(const FILETIME& ft)
+{
+    return ((ULONGLONG) ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
+static inline FILETIME U64ToFileTime(ULONGLONG v)
+{
+    FILETIME ft;
+    ft.dwLowDateTime  = (DWORD) (v & 0xFFFFFFFFULL);
+    ft.dwHighDateTime = (DWORD) (v >> 32);
+    return ft;
+}
+
+// ── 等待 / 计时器类 ──────────────────────────────────────────────────────
+
 typedef VOID (WINAPI* SLEEP) (DWORD);
 
 static SLEEP Real_Sleep = NULL;
 
 VOID WINAPI Hook_Sleep(DWORD dwMilliseconds)
 {
-    Real_Sleep(dwMilliseconds / SpeedFactor());
+    Real_Sleep(ScaleTimeout(dwMilliseconds));
 }
 
 typedef DWORD (WINAPI* SLEEPEX) (DWORD, BOOL);
@@ -183,8 +288,7 @@ static SLEEPEX Real_SleepEx = NULL;
 
 DWORD WINAPI Hook_SleepEx(DWORD dwMilliseconds, BOOL bAlertable)
 {
-
-    return Real_SleepEx(dwMilliseconds / SpeedFactor(), bAlertable);
+    return Real_SleepEx(ScaleTimeout(dwMilliseconds), bAlertable);
 }
 
 typedef DWORD (WINAPI* WAITFORSINGLEOBJECT) (HANDLE, DWORD);
@@ -193,10 +297,7 @@ static WAITFORSINGLEOBJECT Real_WaitForSingleObject = NULL;
 
 DWORD WINAPI Hook_WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)
 {
-    if (dwMilliseconds == 0 || dwMilliseconds == INFINITE) {
-        return Real_WaitForSingleObject(hHandle, dwMilliseconds);
-    }
-    return Real_WaitForSingleObject(hHandle, (DWORD)(dwMilliseconds / SpeedFactor()));
+    return Real_WaitForSingleObject(hHandle, ScaleTimeout(dwMilliseconds));
 }
 
 typedef DWORD (WINAPI* WAITFORSINGLEOBJECTEX) (HANDLE, DWORD, BOOL);
@@ -205,10 +306,7 @@ static WAITFORSINGLEOBJECTEX Real_WaitForSingleObjectEx = NULL;
 
 DWORD WINAPI Hook_WaitForSingleObjectEx(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertable)
 {
-    if (dwMilliseconds == 0 || dwMilliseconds == INFINITE) {
-        return Real_WaitForSingleObjectEx(hHandle, dwMilliseconds, bAlertable);
-    }
-    return Real_WaitForSingleObjectEx(hHandle, (DWORD)(dwMilliseconds / SpeedFactor()), bAlertable);
+    return Real_WaitForSingleObjectEx(hHandle, ScaleTimeout(dwMilliseconds), bAlertable);
 }
 
 typedef DWORD (WINAPI* WAITFORMULTIPLEOBJECTS) (DWORD, const HANDLE*, BOOL, DWORD);
@@ -217,10 +315,7 @@ static WAITFORMULTIPLEOBJECTS Real_WaitForMultipleObjects = NULL;
 
 DWORD WINAPI Hook_WaitForMultipleObjects(DWORD nCount, const HANDLE* lpHandles, BOOL bWaitAll, DWORD dwMilliseconds)
 {
-    if (dwMilliseconds == 0 || dwMilliseconds == INFINITE) {
-        return Real_WaitForMultipleObjects(nCount, lpHandles, bWaitAll, dwMilliseconds);
-    }
-    return Real_WaitForMultipleObjects(nCount, lpHandles, bWaitAll, (DWORD)(dwMilliseconds / SpeedFactor()));
+    return Real_WaitForMultipleObjects(nCount, lpHandles, bWaitAll, ScaleTimeout(dwMilliseconds));
 }
 
 typedef DWORD (WINAPI* WAITFORMULTIPLEOBJECTSEX) (DWORD, const HANDLE*, BOOL, DWORD, BOOL);
@@ -229,10 +324,27 @@ static WAITFORMULTIPLEOBJECTSEX Real_WaitForMultipleObjectsEx = NULL;
 
 DWORD WINAPI Hook_WaitForMultipleObjectsEx(DWORD nCount, const HANDLE* lpHandles, BOOL bWaitAll, DWORD dwMilliseconds, BOOL bAlertable)
 {
-    if (dwMilliseconds == 0 || dwMilliseconds == INFINITE) {
-        return Real_WaitForMultipleObjectsEx(nCount, lpHandles, bWaitAll, dwMilliseconds, bAlertable);
-    }
-    return Real_WaitForMultipleObjectsEx(nCount, lpHandles, bWaitAll, (DWORD)(dwMilliseconds / SpeedFactor()), bAlertable);
+    return Real_WaitForMultipleObjectsEx(nCount, lpHandles, bWaitAll, ScaleTimeout(dwMilliseconds), bAlertable);
+}
+
+// 新增：很多游戏的主循环用 MsgWaitForMultipleObjects(Ex) 一边处理窗口消息一边
+// 等待下一帧。原版没有 hook 它，这类游戏的帧等待不会跟着倍率缩短。
+typedef DWORD (WINAPI* MSGWAITFORMULTIPLEOBJECTS) (DWORD, const HANDLE*, BOOL, DWORD, DWORD);
+
+static MSGWAITFORMULTIPLEOBJECTS Real_MsgWaitForMultipleObjects = NULL;
+
+DWORD WINAPI Hook_MsgWaitForMultipleObjects(DWORD nCount, const HANDLE* pHandles, BOOL fWaitAll, DWORD dwMilliseconds, DWORD dwWakeMask)
+{
+    return Real_MsgWaitForMultipleObjects(nCount, pHandles, fWaitAll, ScaleTimeout(dwMilliseconds), dwWakeMask);
+}
+
+typedef DWORD (WINAPI* MSGWAITFORMULTIPLEOBJECTSEX) (DWORD, const HANDLE*, DWORD, DWORD, DWORD);
+
+static MSGWAITFORMULTIPLEOBJECTSEX Real_MsgWaitForMultipleObjectsEx = NULL;
+
+DWORD WINAPI Hook_MsgWaitForMultipleObjectsEx(DWORD nCount, const HANDLE* pHandles, DWORD dwMilliseconds, DWORD dwWakeMask, DWORD dwFlags)
+{
+    return Real_MsgWaitForMultipleObjectsEx(nCount, pHandles, ScaleTimeout(dwMilliseconds), dwWakeMask, dwFlags);
 }
 
 typedef UINT_PTR (WINAPI* SETTIMER) (HWND, UINT_PTR, UINT, TIMERPROC);
@@ -241,41 +353,13 @@ static SETTIMER Real_SetTimer = NULL;
 
 UINT_PTR WINAPI Hook_SetTimer(HWND hWnd, UINT_PTR nIDEvent, UINT uElapse, TIMERPROC lpTimerFunc)
 {
-
-    return Real_SetTimer(hWnd, nIDEvent, uElapse / SpeedFactor(), lpTimerFunc);
-}
-
-static std::atomic<DWORD> baseReal_TimeGetTime = 0;
-static std::atomic<DWORD> baseHook_TimeGetTime = 0;
-static std::atomic<DWORD> lastReal_TimeGetTime = 0;
-static std::atomic<DWORD> lastHook_TimeGetTime = 0;
-static std::atomic<bool> shouldUpdateTimeGetTime = false;
-
-typedef DWORD (WINAPI* TIMEGETTIME) (VOID);
-
-static TIMEGETTIME Real_TimeGetTime = NULL;
-
-DWORD WINAPI Hook_TimeGetTime(VOID)
-{
-
-    if (pre_factor != SpeedFactor())
+    // SetTimer 接受 0（会被提升到 USER_TIMER_MINIMUM），上限 USER_TIMER_MAXIMUM
+    DWORD v = ScaleTimeout(uElapse);
+    if (v > USER_TIMER_MAXIMUM)
     {
-        pre_factor = SpeedFactor();
-        shouldUpdateAll();
+        v = USER_TIMER_MAXIMUM;
     }
-    bool expected = true;
-    if (shouldUpdateTimeGetTime.compare_exchange_weak(expected, false))
-    {
-        baseReal_TimeGetTime.store(lastReal_TimeGetTime.load());
-        baseHook_TimeGetTime.store(lastHook_TimeGetTime.load());
-    }
-    DWORD now = Real_TimeGetTime();
-    lastReal_TimeGetTime.store(now);
-    DWORD baseReal = baseReal_TimeGetTime.load();
-    DWORD delta = SpeedFactor() * (now - baseReal);
-    DWORD baseHook = baseHook_TimeGetTime.load();
-    lastHook_TimeGetTime.store(baseHook + delta);
-    return baseHook + delta;
+    return Real_SetTimer(hWnd, nIDEvent, v, lpTimerFunc);
 }
 
 typedef MMRESULT (WINAPI* TIMESETEVENT) (UINT, UINT, LPTIMECALLBACK, DWORD_PTR, UINT);
@@ -284,236 +368,46 @@ static TIMESETEVENT Real_TimeSetEvent = NULL;
 
 MMRESULT WINAPI Hook_TimeSetEvent(UINT uDelay, UINT uResolution, LPTIMECALLBACK lpTimeProc, DWORD_PTR dwUser, UINT fuEvent)
 {
-    return Real_TimeSetEvent(uDelay / SpeedFactor(), uResolution, lpTimeProc, dwUser, fuEvent);
+    // 原版在倍率大于 uDelay 时会算出 0，timeSetEvent(0, …) 直接失败。
+    return Real_TimeSetEvent(ScaleDelayMin1(uDelay), uResolution, lpTimeProc, dwUser, fuEvent);
 }
 
-static std::atomic<LONG> baseReal_GetMessageTime = 0;
-static std::atomic<LONG> baseHook_GetMessageTime = 0;
-static std::atomic<LONG> lastReal_GetMessageTime = 0;
-static std::atomic<LONG> lastHook_GetMessageTime = 0;
-static std::atomic<bool> shouldUpdateGetMessageTime = false;
-
-typedef LONG (WINAPI* GETMESSAGETIME) (VOID);
-
-static GETMESSAGETIME Real_GetMessageTime = NULL;
-
-LONG WINAPI Hook_GetMessageTime(VOID)
+// SetWaitableTimer：
+//   * dueTime 为负数 = 相对时间（100ns 单位），可以缩放；
+//   * dueTime 为正数 = 绝对时间（FILETIME），原版把它也除以倍率，结果变成几百年前
+//     （倍率 > 1，立刻触发）或几百年后（倍率 < 1，永远不触发）。现在保持原样。
+//   * lPeriod（周期，毫秒）原版没缩放，周期性计时器完全不受加速影响。现在一起缩放。
+static LARGE_INTEGER ScaleDueTime(const LARGE_INTEGER* lpDueTime)
 {
-
-    if (pre_factor != SpeedFactor())
+    LARGE_INTEGER dueTime = *lpDueTime;
+    if (dueTime.QuadPart < 0)
     {
-        pre_factor = SpeedFactor();
-        shouldUpdateAll();
+        double v = (double) dueTime.QuadPart / SpeedFactor();
+        dueTime.QuadPart = (LONGLONG) v;
+        if (dueTime.QuadPart == 0)
+        {
+            dueTime.QuadPart = -1; // 仍然是相对时间，避免变成“绝对时间 0”
+        }
     }
-    bool expected = true;
-    if (shouldUpdateGetMessageTime.compare_exchange_weak(expected, false))
-    {
-        baseReal_GetMessageTime.store(lastReal_GetMessageTime.load());
-        baseHook_GetMessageTime.store(lastHook_GetMessageTime.load());
-    }
-    LONG now = Real_GetMessageTime();
-    lastReal_GetMessageTime.store(now);
-    LONG baseReal = baseReal_GetMessageTime.load();
-    DWORD delta = SpeedFactor() * (now - baseReal);
-    LONG baseHook = baseHook_GetMessageTime.load();
-    lastHook_GetMessageTime.store(baseHook + delta);
-    return baseHook + delta;
+    return dueTime;
 }
 
-static std::atomic<DWORD> baseReal_GetTickCount = 0;
-static std::atomic<DWORD> baseHook_GetTickCount = 0;
-static std::atomic<DWORD> lastReal_GetTickCount = 0;
-static std::atomic<DWORD> lastHook_GetTickCount = 0;
-static std::atomic<bool> shouldUpdateGetTickCount = false;
-
-typedef DWORD (WINAPI* GETTICKCOUNT) (VOID);
-
-static GETTICKCOUNT Real_GetTickCount = NULL;
-
-DWORD WINAPI Hook_GetTickCount(VOID)
+static LONG ScalePeriod(LONG lPeriod)
 {
-
-    if (pre_factor != SpeedFactor())
+    if (lPeriod <= 0)
     {
-        pre_factor = SpeedFactor();
-        shouldUpdateAll();
+        return lPeriod;
     }
-    bool expected = true;
-    if (shouldUpdateGetTickCount.compare_exchange_weak(expected, false))
+    DWORD v = ScaleTimeout((DWORD) lPeriod);
+    if (v == 0)
     {
-        baseReal_GetTickCount.store(lastReal_GetTickCount.load());
-        baseHook_GetTickCount.store(lastHook_GetTickCount.load());
+        v = 1; // 0 表示“只触发一次”，不能让周期计时器变成单次
     }
-    DWORD now = Real_GetTickCount();
-    lastReal_GetTickCount.store(now);
-    DWORD baseReal = baseReal_GetTickCount.load();
-    DWORD delta = SpeedFactor() * (now - baseReal);
-    DWORD baseHook = baseHook_GetTickCount.load();
-    lastHook_GetTickCount.store(baseHook + delta);
-    return baseHook + delta;
-}
-
-static std::atomic<ULONGLONG> baseReal_GetTickCount64 = 0;
-static std::atomic<ULONGLONG> baseHook_GetTickCount64 = 0;
-static std::atomic<ULONGLONG> lastReal_GetTickCount64 = 0;
-static std::atomic<ULONGLONG> lastHook_GetTickCount64 = 0;
-std::atomic<bool> shouldUpdateGetTickCount64 = false;
-
-typedef ULONGLONG (WINAPI* GETTICKCOUNT64) (VOID);
-
-static GETTICKCOUNT64 Real_GetTickCount64 = NULL;
-
-ULONGLONG WINAPI Hook_GetTickCount64(VOID)
-{
-
-    if (pre_factor != SpeedFactor())
+    if (v > 0x7FFFFFFF)
     {
-        pre_factor = SpeedFactor();
-        shouldUpdateAll();
+        v = 0x7FFFFFFF;
     }
-    bool expected = true;
-    if (shouldUpdateGetTickCount64.compare_exchange_weak(expected, false))
-    {
-        baseReal_GetTickCount64.store(lastReal_GetTickCount64.load());
-        baseHook_GetTickCount64.store(lastHook_GetTickCount64.load());
-    }
-    ULONGLONG now = Real_GetTickCount64();
-    lastReal_GetTickCount64.store(now);
-    ULONGLONG baseReal = baseReal_GetTickCount64.load();
-    ULONGLONG delta = SpeedFactor() * (now - baseReal);
-    ULONGLONG baseHook = baseHook_GetTickCount64.load();
-    lastHook_GetTickCount64.store(baseHook + delta);
-    return baseHook + delta;
-}
-
-static std::atomic<LARGE_INTEGER> baseReal_QueryPerformanceCounter{};
-static std::atomic<LARGE_INTEGER> baseHook_QueryPerformanceCounter{};
-static std::atomic<LARGE_INTEGER> lastReal_QueryPerformanceCounter{};
-static std::atomic<LARGE_INTEGER> lastHook_QueryPerformanceCounter{};
-static std::atomic<bool> shouldUpdateQueryPerformanceCounter = false;
-
-typedef BOOL (WINAPI* QUERYPERFORMANCECOUNTER) (LARGE_INTEGER*);
-
-static QUERYPERFORMANCECOUNTER Real_QueryPerformanceCounter = NULL;
-
-BOOL WINAPI Hook_QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount)
-{
-
-    if (lpPerformanceCount == NULL)
-    {
-        return FALSE;
-    }
-    if (pre_factor != SpeedFactor())
-    {
-        pre_factor = SpeedFactor();
-        shouldUpdateAll();
-    }
-    // 更新基准时间点
-    bool expected = true;
-    if (shouldUpdateQueryPerformanceCounter.compare_exchange_weak(expected, false))
-    {
-        baseReal_QueryPerformanceCounter.store(lastReal_QueryPerformanceCounter.load());
-        baseHook_QueryPerformanceCounter.store(lastHook_QueryPerformanceCounter.load());
-    }
-    LARGE_INTEGER now;
-    BOOL rtncode = Real_QueryPerformanceCounter(&now);
-    lastReal_QueryPerformanceCounter.store(now);
-    LARGE_INTEGER baseReal = baseReal_QueryPerformanceCounter.load();
-    LARGE_INTEGER baseHook = baseHook_QueryPerformanceCounter.load();
-    LONGLONG delta = SpeedFactor() * (now.QuadPart - baseReal.QuadPart);
-    LARGE_INTEGER result;
-    result.QuadPart = baseHook.QuadPart + delta;
-    *lpPerformanceCount = result;
-    lastHook_QueryPerformanceCounter.store(result);
-    return rtncode;
-}
-
-static std::atomic<FILETIME> baseReal_GetSystemTimeAsFileTime({ 0 });
-static std::atomic<FILETIME> baseHook_GetSystemTimeAsFileTime({ 0 });
-static std::atomic<FILETIME> lastReal_GetSystemTimeAsFileTime({ 0 });
-static std::atomic<FILETIME> lastHook_GetSystemTimeAsFileTime({ 0 });
-static std::atomic<bool> shouldUpdateGetSystemTimeAsFileTime = false;
-
-typedef VOID (WINAPI* GETSYSTEMTIMEASFILETIME) (LPFILETIME);
-
-static GETSYSTEMTIMEASFILETIME Real_GetSystemTimeAsFileTime = NULL;
-
-VOID WINAPI Hook_GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)
-{
-
-    if (lpSystemTimeAsFileTime == NULL)
-    {
-        return;
-    }
-    if (pre_factor != SpeedFactor())
-    {
-        pre_factor = SpeedFactor();
-        shouldUpdateAll();
-    }
-    bool expected = true;
-    if (shouldUpdateGetSystemTimeAsFileTime.compare_exchange_weak(expected, false))
-    {
-        baseReal_GetSystemTimeAsFileTime.store(lastReal_GetSystemTimeAsFileTime.load());
-        baseHook_GetSystemTimeAsFileTime.store(lastHook_GetSystemTimeAsFileTime.load());
-    }
-    // 从全局变量读取基准点快照到线程栈
-    FILETIME baseReal_Snapshot = baseReal_GetSystemTimeAsFileTime.load();
-    ULARGE_INTEGER baseReal_ = { baseReal_Snapshot.dwLowDateTime, baseReal_Snapshot.dwHighDateTime };
-    FILETIME baseHook_Snapshot = baseHook_GetSystemTimeAsFileTime.load();
-    ULARGE_INTEGER baseHook_ = { baseHook_Snapshot.dwLowDateTime, baseHook_Snapshot.dwHighDateTime };
-    FILETIME ftNow = { 0 };
-    Real_GetSystemTimeAsFileTime(&ftNow);
-    lastReal_GetSystemTimeAsFileTime.store(ftNow);
-    ULARGE_INTEGER ulNow = { ftNow.dwLowDateTime, ftNow.dwHighDateTime };
-    ULONGLONG delta = SpeedFactor() * (ulNow.QuadPart - baseReal_.QuadPart);
-    ULARGE_INTEGER ulRtn = { 0 };
-    ulRtn.QuadPart = baseHook_.QuadPart + delta;
-    lastHook_GetSystemTimeAsFileTime.store({ ulRtn.LowPart, ulRtn.HighPart });
-    (*lpSystemTimeAsFileTime) = { ulRtn.LowPart, ulRtn.HighPart };
-}
-
-static std::atomic<FILETIME> baseReal_GetSystemTimePreciseAsFileTime({ 0 });
-static std::atomic<FILETIME> baseHook_GetSystemTimePreciseAsFileTime({ 0 });
-static std::atomic<FILETIME> lastReal_GetSystemTimePreciseAsFileTime({ 0 });
-static std::atomic<FILETIME> lastHook_GetSystemTimePreciseAsFileTime({ 0 });
-static std::atomic<bool> shouldUpdateGetSystemTimePreciseAsFileTime = false;
-
-typedef VOID (WINAPI* GETSYSTEMTIMEPRECISEASFILETIME) (LPFILETIME);
-
-static GETSYSTEMTIMEPRECISEASFILETIME Real_GetSystemTimePreciseAsFileTime = NULL;
-
-VOID WINAPI Hook_GetSystemTimePreciseAsFileTime(LPFILETIME lpSystemTimeAsFileTime)
-{
-
-    if (lpSystemTimeAsFileTime == NULL)
-    {
-        return;
-    }
-    if (pre_factor != SpeedFactor())
-    {
-        pre_factor = SpeedFactor();
-        shouldUpdateAll();
-    }
-    bool expected = true;
-    if (shouldUpdateGetSystemTimePreciseAsFileTime.compare_exchange_weak(expected, false))
-    {
-        baseReal_GetSystemTimePreciseAsFileTime.store(lastReal_GetSystemTimePreciseAsFileTime.load());
-        baseHook_GetSystemTimePreciseAsFileTime.store(lastHook_GetSystemTimePreciseAsFileTime.load());
-    }
-    // 从全局变量读取基准点快照到线程栈
-    FILETIME baseReal_Snapshot = baseReal_GetSystemTimePreciseAsFileTime.load();
-    ULARGE_INTEGER baseReal_ = { baseReal_Snapshot.dwLowDateTime, baseReal_Snapshot.dwHighDateTime };
-    FILETIME baseHook_Snapshot = baseHook_GetSystemTimePreciseAsFileTime.load();
-    ULARGE_INTEGER baseHook_ = { baseHook_Snapshot.dwLowDateTime, baseHook_Snapshot.dwHighDateTime };
-    FILETIME ftNow = { 0 };
-    Real_GetSystemTimePreciseAsFileTime(&ftNow);
-    lastReal_GetSystemTimePreciseAsFileTime.store(ftNow);
-    ULARGE_INTEGER ulNow = { ftNow.dwLowDateTime, ftNow.dwHighDateTime };
-    ULONGLONG delta = SpeedFactor() * (ulNow.QuadPart - baseReal_.QuadPart);
-    ULARGE_INTEGER ulRtn = { 0 };
-    ulRtn.QuadPart = baseHook_.QuadPart + delta;
-    lastHook_GetSystemTimePreciseAsFileTime.store({ ulRtn.LowPart, ulRtn.HighPart });
-    (*lpSystemTimeAsFileTime) = { ulRtn.LowPart, ulRtn.HighPart };
+    return (LONG) v;
 }
 
 typedef BOOL (WINAPI* SETWAITABLETIMER) (HANDLE, const LARGE_INTEGER*, LONG, PTIMERAPCROUTINE, LPVOID, BOOL);
@@ -524,11 +418,10 @@ BOOL WINAPI Hook_SetWaitableTimer(HANDLE hTimer, const LARGE_INTEGER* lpDueTime,
 {
     if (lpDueTime == NULL)
     {
-        return FALSE;
+        return Real_SetWaitableTimer(hTimer, lpDueTime, lPeriod, pfnCompletionRoutine, lpArgToCompletionRoutine, fResume);
     }
-    LARGE_INTEGER dueTime = {0};
-    dueTime.QuadPart = lpDueTime->QuadPart / SpeedFactor();
-    return Real_SetWaitableTimer(hTimer, &dueTime, lPeriod, pfnCompletionRoutine, lpArgToCompletionRoutine, fResume);
+    LARGE_INTEGER dueTime = ScaleDueTime(lpDueTime);
+    return Real_SetWaitableTimer(hTimer, &dueTime, ScalePeriod(lPeriod), pfnCompletionRoutine, lpArgToCompletionRoutine, fResume);
 }
 
 typedef BOOL (WINAPI* SETWAITABLETIMEREX) (HANDLE, const LARGE_INTEGER*, LONG, PTIMERAPCROUTINE, LPVOID, PREASON_CONTEXT, ULONG);
@@ -539,22 +432,104 @@ BOOL WINAPI Hook_SetWaitableTimerEx(HANDLE hTimer, const LARGE_INTEGER* lpDueTim
 {
     if (lpDueTime == NULL)
     {
-        return FALSE;
+        return Real_SetWaitableTimerEx(hTimer, lpDueTime, lPeriod, pfnCompletionRoutine, lpArgToCompletionRoutine, WakeContext, TolerableDelay);
     }
-    LARGE_INTEGER dueTime = {0};
-    dueTime.QuadPart = lpDueTime->QuadPart / SpeedFactor();
-    return Real_SetWaitableTimerEx(hTimer, &dueTime, lPeriod, pfnCompletionRoutine, lpArgToCompletionRoutine, WakeContext, TolerableDelay);
+    LARGE_INTEGER dueTime = ScaleDueTime(lpDueTime);
+    return Real_SetWaitableTimerEx(hTimer, &dueTime, ScalePeriod(lPeriod), pfnCompletionRoutine, lpArgToCompletionRoutine, WakeContext, TolerableDelay);
 }
 
-inline VOID shouldUpdateAll()
+// ── 时间读取类 ───────────────────────────────────────────────────────────
+
+typedef DWORD (WINAPI* TIMEGETTIME) (VOID);
+
+static TIMEGETTIME Real_TimeGetTime = NULL;
+
+DWORD WINAPI Hook_TimeGetTime(VOID)
 {
-    shouldUpdateTimeGetTime = true;
-    shouldUpdateGetMessageTime = true;
-    shouldUpdateGetTickCount = true;
-    shouldUpdateGetTickCount64 = true;
-    shouldUpdateQueryPerformanceCounter = true;
-    shouldUpdateGetSystemTimeAsFileTime = true;
-    shouldUpdateGetSystemTimePreciseAsFileTime = true;
+    return clk_TimeGetTime.Now([] { return Real_TimeGetTime(); });
+}
+
+typedef LONG (WINAPI* GETMESSAGETIME) (VOID);
+
+static GETMESSAGETIME Real_GetMessageTime = NULL;
+
+LONG WINAPI Hook_GetMessageTime(VOID)
+{
+    return (LONG) clk_GetMessageTime.Now([] { return (DWORD) Real_GetMessageTime(); });
+}
+
+typedef DWORD (WINAPI* GETTICKCOUNT) (VOID);
+
+static GETTICKCOUNT Real_GetTickCount = NULL;
+
+DWORD WINAPI Hook_GetTickCount(VOID)
+{
+    return clk_GetTickCount.Now([] { return Real_GetTickCount(); });
+}
+
+typedef ULONGLONG (WINAPI* GETTICKCOUNT64) (VOID);
+
+static GETTICKCOUNT64 Real_GetTickCount64 = NULL;
+
+ULONGLONG WINAPI Hook_GetTickCount64(VOID)
+{
+    return clk_GetTickCount64.Now([] { return Real_GetTickCount64(); });
+}
+
+typedef BOOL (WINAPI* QUERYPERFORMANCECOUNTER) (LARGE_INTEGER*);
+
+static QUERYPERFORMANCECOUNTER Real_QueryPerformanceCounter = NULL;
+
+BOOL WINAPI Hook_QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount)
+{
+    if (lpPerformanceCount == NULL)
+    {
+        return Real_QueryPerformanceCounter(lpPerformanceCount);
+    }
+    BOOL rtncode = TRUE;
+    ULONGLONG v = clk_QueryPerformanceCounter.Now([&rtncode] {
+        LARGE_INTEGER now;
+        rtncode = Real_QueryPerformanceCounter(&now);
+        return (ULONGLONG) now.QuadPart;
+    });
+    lpPerformanceCount->QuadPart = (LONGLONG) v;
+    return rtncode;
+}
+
+typedef VOID (WINAPI* GETSYSTEMTIMEASFILETIME) (LPFILETIME);
+
+static GETSYSTEMTIMEASFILETIME Real_GetSystemTimeAsFileTime = NULL;
+
+VOID WINAPI Hook_GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)
+{
+    if (lpSystemTimeAsFileTime == NULL)
+    {
+        return;
+    }
+    ULONGLONG v = clk_GetSystemTimeAsFileTime.Now([] {
+        FILETIME ft = { 0, 0 };
+        Real_GetSystemTimeAsFileTime(&ft);
+        return FileTimeToU64(ft);
+    });
+    *lpSystemTimeAsFileTime = U64ToFileTime(v);
+}
+
+typedef VOID (WINAPI* GETSYSTEMTIMEPRECISEASFILETIME) (LPFILETIME);
+
+static GETSYSTEMTIMEPRECISEASFILETIME Real_GetSystemTimePreciseAsFileTime = NULL;
+
+VOID WINAPI Hook_GetSystemTimePreciseAsFileTime(LPFILETIME lpSystemTimeAsFileTime)
+{
+    if (lpSystemTimeAsFileTime == NULL)
+    {
+        return;
+    }
+    ULONGLONG v = clk_GetSystemTimePreciseAsFileTime.Now([] {
+        FILETIME ft = { 0, 0 };
+        Real_GetSystemTimePreciseAsFileTime(&ft);
+        return FileTimeToU64(ft);
+    });
+    *lpSystemTimeAsFileTime = U64ToFileTime(v);
 }
 
 // 记录 hook 安装失败。DllMain 运行在加载器锁里：既不能弹 MessageBox（模态框会把
@@ -601,7 +576,6 @@ VOID MH_UNHOOK(T* pTarget)
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
-    FILETIME now = { 0 };
     switch (ul_reason_for_call)
     {
     case DLL_PROCESS_ATTACH:
@@ -613,57 +587,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             return FALSE;
         }
         SP_Install();
-        {
-            /* Initial timeGetTime */
-            DWORD tgt = timeGetTime();
-            baseReal_TimeGetTime.store(tgt);
-            lastReal_TimeGetTime.store(tgt);
-            baseHook_TimeGetTime.store(tgt);
-            lastHook_TimeGetTime.store(tgt);
-
-            /* Initial GetMessageTime */
-            LONG gmt = GetMessageTime();
-            baseReal_GetMessageTime.store(gmt);
-            lastReal_GetMessageTime.store(gmt);
-            baseHook_GetMessageTime.store(gmt);
-            lastHook_GetMessageTime.store(gmt);
-
-            /* Initial GetTickCount */
-            DWORD tck = GetTickCount();
-            baseReal_GetTickCount.store(tck);
-            lastReal_GetTickCount.store(tck);
-            baseHook_GetTickCount.store(tck);
-            lastHook_GetTickCount.store(tck);
-
-            /* Initial GetTickCount64 */
-            ULONGLONG tck64 = GetTickCount64();
-            baseReal_GetTickCount64.store(tck64);
-            lastReal_GetTickCount64.store(tck64);
-            baseHook_GetTickCount64.store(tck64);
-            lastHook_GetTickCount64.store(tck64);
-
-            /* Initial QueryPerformanceCounter */
-            LARGE_INTEGER qpc;
-            QueryPerformanceCounter(&qpc);
-            baseReal_QueryPerformanceCounter.store(qpc);
-            lastReal_QueryPerformanceCounter.store(qpc);
-            baseHook_QueryPerformanceCounter.store(qpc);
-            lastHook_QueryPerformanceCounter.store(qpc);
-
-            /* Initial GetSystemTimeAsFileTime */
-            GetSystemTimeAsFileTime(&now);
-            baseReal_GetSystemTimeAsFileTime.store(now);
-            lastReal_GetSystemTimeAsFileTime.store(now);
-            baseHook_GetSystemTimeAsFileTime.store(now);
-            lastHook_GetSystemTimeAsFileTime.store(now);
-
-            /* Initial GetSystemTimePreciseAsFileTime */
-            GetSystemTimePreciseAsFileTime(&now);
-            baseReal_GetSystemTimePreciseAsFileTime.store(now);
-            lastReal_GetSystemTimePreciseAsFileTime.store(now);
-        baseHook_GetSystemTimePreciseAsFileTime.store(now);
-        lastHook_GetSystemTimePreciseAsFileTime.store(now);
-        }
+        // 各个时钟在第一次被调用时以当时的真实时间初始化（见 ScaledClock），
+        // 这里不再需要预先读取。
 
         MH_HOOK(&Sleep, &Hook_Sleep, reinterpret_cast<LPVOID*> (&Real_Sleep));
         MH_HOOK(&SleepEx, &Hook_SleepEx, reinterpret_cast<LPVOID*>(&Real_SleepEx));
@@ -673,6 +598,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         MH_HOOK(&WaitForMultipleObjectsEx, &Hook_WaitForMultipleObjectsEx, reinterpret_cast<LPVOID*>(&Real_WaitForMultipleObjectsEx));
         MH_HOOK(&SetWaitableTimer, &Hook_SetWaitableTimer, reinterpret_cast<LPVOID*>(&Real_SetWaitableTimer));
         MH_HOOK(&SetWaitableTimerEx, &Hook_SetWaitableTimerEx, reinterpret_cast<LPVOID*>(&Real_SetWaitableTimerEx));
+        MH_HOOK(&MsgWaitForMultipleObjects, &Hook_MsgWaitForMultipleObjects, reinterpret_cast<LPVOID*>(&Real_MsgWaitForMultipleObjects));
+        MH_HOOK(&MsgWaitForMultipleObjectsEx, &Hook_MsgWaitForMultipleObjectsEx, reinterpret_cast<LPVOID*>(&Real_MsgWaitForMultipleObjectsEx));
         MH_HOOK(&SetTimer, &Hook_SetTimer, reinterpret_cast<LPVOID*> (&Real_SetTimer));
         MH_HOOK(&timeGetTime, &Hook_TimeGetTime, reinterpret_cast<LPVOID*> (&Real_TimeGetTime));
         MH_HOOK(&timeSetEvent, &Hook_TimeSetEvent, reinterpret_cast<LPVOID*>(&Real_TimeSetEvent));
