@@ -118,7 +118,11 @@ fn send_recv(h: HANDLE, cmd: &str) -> Result<String, ()> {
     if rd.is_err() || nread == 0 { return Err(()); }
 
     let resp = String::from_utf8_lossy(&buf[..nread as usize]).trim().to_string();
-    eprintln!("[bridge] {cmd} → {resp}");
+    // Goes to the app log (upstream used eprintln!, which a GUI app discards).
+    // Health-check GETSPEEDs are frequent and uninteresting, so skip those.
+    if cmd != "GETSPEED" {
+        crate::applog::info("bridge", format!("{cmd} → {resp}"));
+    }
     Ok(resp)
 }
 
