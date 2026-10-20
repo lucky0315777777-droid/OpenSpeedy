@@ -4,7 +4,7 @@
 //!   INJECT <pid>  EJECT <pid>  ENABLE <pid>  DISABLE <pid>
 //!   ISENABLED <pid>  SETSPEED <factor>  GETSPEED  SHUTDOWN
 //!
-//!   STATUS <pid>  — check injection + enabled status
+//!   STATUS <pid>  — "OK ENABLED" | "OK DISABLED" | "OK NOTINJECTED"
 //!
 //! Responses:  OK [value]  or  ERROR <message>
 
@@ -83,6 +83,25 @@ fn install_crash_handler() {
     }
 }
 
+// ── Logging ──────────────────────────────────────────────────────────────
+// stderr is redirected to bridgeXX.exe.log by the app. Every line now carries a
+// local timestamp so it can be matched against openspeedy.YYYYMMDD.log.
+
+fn log_ts() -> String {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let t = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+    )
+}
+
+macro_rules! blog {
+    ($($arg:tt)*) => {
+        eprintln!("{} {}", crate::log_ts(), format!($($arg)*))
+    };
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -103,7 +122,7 @@ fn exe_dir() -> PathBuf {
 fn is_process_64bit(pid: u32) -> bool {
     unsafe {
         let Ok(h) = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) else {
-            eprintln!("[bridge] is_process_64bit({pid}): OpenProcess failed, assuming 64-bit");
+            blog!("[bridge] is_process_64bit({pid}): OpenProcess failed, assuming 64-bit");
             return true;
         };
         let mut wow64 = BOOL::default();
@@ -114,7 +133,7 @@ fn is_process_64bit(pid: u32) -> bool {
         if let Some(f) = is_wow64 { f(h, &mut wow64); }
         let _ = CloseHandle(h);
         let result = !wow64.as_bool();
-        eprintln!("[bridge] is_process_64bit({pid}): wow64={} -> is64={result}", wow64.as_bool());
+        blog!("[bridge] is_process_64bit({pid}): wow64={} -> is64={result}", wow64.as_bool());
         result
     }
 }
@@ -128,14 +147,108 @@ fn speedpatch_dll(is64: bool) -> &'static str {
     if is64 { "speedpatch64.dll" } else { "speedpatch32.dll" }
 }
 
+// ── Own copy of the speedpatch DLL ───────────────────────────────────────
+//
+// The bridge itself loads speedpatch*.dll to call SP_SetSpeed / SP_Enable /
+// ... (the speed factor lives in a section shared by every process that maps
+// the DLL). Loading it runs DllMain, which hooks the *bridge's own* time APIs
+// and — through SP_Install — marks the bridge as enabled.
+//
+// Upstream left it that way, so at speed ×10 the bridge's own
+// `WaitForSingleObject(remote_thread, 5000)` during INJECT only waited 500 ms
+// (×100 → 50 ms). When the game was busy (loading, holding the loader lock)
+// the wait timed out, GetExitCodeThread returned STILL_ACTIVE (259 ≠ 0), that
+// was counted as success, and the DLL path buffer was freed while the game's
+// LoadLibraryW was still reading it. Result: "INJECT OK" in the log but no
+// speed change — the intermittent failure.
+//
+// Fix: load the DLL once, by full path, and immediately disable speed control
+// for the bridge's own PID so its hooks pass time through unchanged.
+
+static OWN_DLL: std::sync::OnceLock<Option<isize>> = std::sync::OnceLock::new();
+
+fn own_dll() -> Option<windows::Win32::Foundation::HMODULE> {
+    use windows::Win32::Foundation::HMODULE;
+    let raw = OWN_DLL.get_or_init(|| {
+        let path = exe_dir().join(OWN_SPEEDPATCH);
+        let wide = to_wide(&path.to_string_lossy());
+        let h = match unsafe { LoadLibraryW(PCWSTR::from_raw(wide.as_ptr())) } {
+            Ok(h) => h,
+            Err(e) => {
+                blog!("[bridge] cannot load own {}: {e:?}", path.display());
+                return None;
+            }
+        };
+        unsafe {
+            let sp_disable: Option<unsafe extern "C" fn(u32)> =
+                std::mem::transmute(GetProcAddress(h, s!("SP_Disable")));
+            if let Some(f) = sp_disable {
+                f(std::process::id());
+                blog!("[bridge] loaded own {OWN_SPEEDPATCH}; speed control disabled for the bridge itself");
+            }
+        }
+        Some(h.0 as isize)
+    });
+    raw.map(|v| HMODULE(v as *mut std::ffi::c_void))
+}
+
+/// Resolve an export of our own copy of the DLL.
+fn own_proc(name: &'static [u8]) -> Option<unsafe extern "system" fn() -> isize> {
+    let h = own_dll()?;
+    unsafe { GetProcAddress(h, PCSTR::from_raw(name.as_ptr())) }
+}
+
+// ── Helpers on the target process ────────────────────────────────────────
+
+/// Look up `dll_name` in the target's module list. Returns its base address.
+fn find_module(pid: u32, dll_name: &str) -> Option<*mut std::ffi::c_void> {
+    use windows::Win32::System::Diagnostics::ToolHelp::TH32CS_SNAPMODULE32;
+    // SNAPMODULE32 is required to see modules of a 32-bit (WOW64) target from
+    // a 64-bit snapshotting process; harmless otherwise.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) }.ok()?;
+    let mut me = MODULEENTRY32W { dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32, ..Default::default() };
+    let want = dll_name.to_lowercase();
+    let mut found = None;
+    unsafe {
+        if Module32FirstW(snap, &mut me).is_ok() {
+            loop {
+                let name = String::from_utf16_lossy(&me.szModule).trim_end_matches('\0').to_lowercase();
+                if name == want {
+                    found = Some(me.hModule.0 as *mut std::ffi::c_void);
+                    break;
+                }
+                if Module32NextW(snap, &mut me).is_err() { break; }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    found
+}
+
 // ── Core operations ──────────────────────────────────────────────────────
 
-/// Try injecting via LoadLibraryW, fall back to LoadLibraryA.
+const STILL_ACTIVE: u32 = 259;
+/// How long to wait for the remote LoadLibrary. Generous on purpose: a game
+/// that is loading assets can hold the loader lock for several seconds.
+const INJECT_WAIT_MS: u32 = 15_000;
+
 fn do_inject(pid: u32) -> Result<(), String> {
+    if pid == 0 { return Err("invalid pid 0".into()); }
     let is64 = is_process_64bit(pid);
     let dll_name = speedpatch_dll(is64);
-    eprintln!("[bridge] INJECT pid={pid} arch={} dll={dll_name}", if is64 { "x64" } else { "x86" });
+    blog!("[bridge] INJECT pid={pid} arch={} dll={dll_name}", if is64 { "x64" } else { "x86" });
+
+    // Already there (e.g. OpenSpeedy was restarted while the game kept
+    // running): nothing to load. LoadLibrary would only bump the refcount.
+    if let Some(base) = find_module(pid, dll_name) {
+        blog!("[bridge] INJECT pid={pid}: {dll_name} already loaded at {base:?} — skipping LoadLibrary");
+        return Ok(());
+    }
+
     let dll_path = exe_dir().join(dll_name);
+    if !dll_path.exists() {
+        return Err(format!("{} not found", dll_path.display()));
+    }
     let dll_str = dll_path.to_string_lossy().to_string();
 
     let h_proc = unsafe {
@@ -144,28 +257,33 @@ fn do_inject(pid: u32) -> Result<(), String> {
             | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
             false, pid,
         )
-    }.map_err(|e| format!("OpenProcess: {e:?}"))?;
+    }.map_err(|e| format!("OpenProcess: {e:?} (game running as admin while OpenSpeedy is not?)"))?;
 
-    // Try LoadLibraryW first
-    if try_inject_impl(&h_proc, &dll_str, "LoadLibraryW", true) {
-        unsafe { let _ = CloseHandle(h_proc); }
-        return Ok(());
+    let mut result = try_inject_impl(&h_proc, &dll_str, "LoadLibraryW", true);
+    if result.is_err() && find_module(pid, dll_name).is_none() {
+        blog!("[bridge] LoadLibraryW path failed ({}), trying LoadLibraryA", result.as_ref().unwrap_err());
+        result = try_inject_impl(&h_proc, &dll_str, "LoadLibraryA", false);
     }
-
-    // Fallback: LoadLibraryA
-    if try_inject_impl(&h_proc, &dll_str, "LoadLibraryA", false) {
-        unsafe { let _ = CloseHandle(h_proc); }
-        return Ok(());
-    }
-
     unsafe { let _ = CloseHandle(h_proc); }
-    Err("both LoadLibraryW and LoadLibraryA injection failed".into())
+
+    // The module list is the ground truth — the thread exit code is only the
+    // low 32 bits of an HMODULE and says nothing if the wait timed out.
+    match find_module(pid, dll_name) {
+        Some(base) => {
+            blog!("[bridge] INJECT pid={pid}: verified {dll_name} loaded at {base:?}");
+            Ok(())
+        }
+        None => Err(match result {
+            Err(e) => e,
+            Ok(()) => format!("LoadLibrary reported success but {dll_name} is not in the target's module list"),
+        }),
+    }
 }
 
 /// Attempt injection with a specific LoadLibrary variant.
 /// `wide` = true → use wide-char path (LoadLibraryW), false → ANSI (LoadLibraryA).
-fn try_inject_impl(h_proc: &HANDLE, dll_path: &str, fn_name: &str, wide: bool) -> bool {
-    eprintln!("[bridge] try_inject_impl: dll={dll_path} fn={fn_name} wide={wide}");
+fn try_inject_impl(h_proc: &HANDLE, dll_path: &str, fn_name: &str, wide: bool) -> Result<(), String> {
+    blog!("[bridge] try_inject_impl: dll={dll_path} fn={fn_name}");
 
     let path_bytes: Vec<u8> = if wide {
         dll_path.encode_utf16()
@@ -179,42 +297,29 @@ fn try_inject_impl(h_proc: &HANDLE, dll_path: &str, fn_name: &str, wide: bool) -
             .collect()
     };
     let path_len = path_bytes.len();
-    eprintln!("[bridge] path_bytes len={path_len}");
 
     let remote_mem = unsafe {
         VirtualAllocEx(*h_proc, None, path_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
     };
     if remote_mem.is_null() {
-        eprintln!("[bridge] VirtualAllocEx failed");
-        return false;
+        return Err("VirtualAllocEx failed".into());
     }
-    eprintln!("[bridge] VirtualAllocEx ok, remote_mem={remote_mem:?}");
 
-    unsafe {
-        let _ = WriteProcessMemory(*h_proc, remote_mem, path_bytes.as_ptr() as _, path_len, None);
+    let wrote = unsafe {
+        WriteProcessMemory(*h_proc, remote_mem, path_bytes.as_ptr() as _, path_len, None)
+    };
+    if let Err(e) = wrote {
+        unsafe { let _ = VirtualFreeEx(*h_proc, remote_mem, 0, MEM_RELEASE); }
+        return Err(format!("WriteProcessMemory: {e:?}"));
     }
-    eprintln!("[bridge] WriteProcessMemory done");
 
     let wide_k32 = to_wide("kernel32.dll");
-    let kernel32 = match unsafe {
-        GetModuleHandleW(PCWSTR::from_raw(wide_k32.as_ptr()))
-    } {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    eprintln!("[bridge] GetModuleHandleW(kernel32) ok");
+    let kernel32 = unsafe { GetModuleHandleW(PCWSTR::from_raw(wide_k32.as_ptr())) }
+        .map_err(|e| format!("GetModuleHandleW(kernel32): {e:?}"))?;
 
     let fn_cstr = std::ffi::CString::new(fn_name).unwrap();
-    let load_lib = unsafe {
-        match GetProcAddress(kernel32, PCSTR::from_raw(fn_cstr.as_ptr() as *const u8)) {
-            Some(ptr) => ptr,
-            None => {
-                eprintln!("[bridge] GetProcAddress({fn_name}) failed");
-                return false;
-            }
-        }
-    };
-    eprintln!("[bridge] GetProcAddress({fn_name}) ok = {load_lib:?}");
+    let load_lib = unsafe { GetProcAddress(kernel32, PCSTR::from_raw(fn_cstr.as_ptr() as *const u8)) }
+        .ok_or_else(|| format!("GetProcAddress({fn_name}) failed"))?;
 
     let h_thread = match unsafe {
         CreateRemoteThread(*h_proc, None, 0,
@@ -222,57 +327,44 @@ fn try_inject_impl(h_proc: &HANDLE, dll_path: &str, fn_name: &str, wide: bool) -
     } {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("[bridge] CreateRemoteThread failed: {e:?}");
-            unsafe { VirtualFreeEx(*h_proc, remote_mem, 0, MEM_RELEASE); }
-            return false;
+            unsafe { let _ = VirtualFreeEx(*h_proc, remote_mem, 0, MEM_RELEASE); }
+            return Err(format!("CreateRemoteThread: {e:?}"));
         }
     };
-    eprintln!("[bridge] CreateRemoteThread ok, h_thread={h_thread:?}");
 
-    // Wait for LoadLibrary to complete and check result
-    unsafe { WaitForSingleObject(h_thread, 5000); }
-    eprintln!("[bridge] WaitForSingleObject done");
+    let started = std::time::Instant::now();
+    let wait = unsafe { WaitForSingleObject(h_thread, INJECT_WAIT_MS) };
+    let waited_ms = started.elapsed().as_millis();
 
     let mut exit_code = 0u32;
-    let ok = unsafe {
+    let got_code = unsafe {
         use windows::Win32::System::Threading::GetExitCodeThread;
         GetExitCodeThread(h_thread, &mut exit_code)
     };
-    eprintln!("[bridge] GetExitCodeThread ok={ok:?} exit_code={exit_code}");
+    unsafe { let _ = CloseHandle(h_thread); }
+    blog!("[bridge] remote {fn_name}: wait={wait:?} after {waited_ms} ms, exit_code={exit_code:#x}");
 
-    unsafe { VirtualFreeEx(*h_proc, remote_mem, 0, MEM_RELEASE); let _ = CloseHandle(h_thread); }
-    eprintln!("[bridge] cleanup done, LoadLibrary result={}", exit_code != 0);
+    if got_code.is_err() || exit_code == STILL_ACTIVE {
+        // The remote LoadLibrary is still running and still reading the path
+        // buffer. Freeing it now is a use-after-free in the game. Leak the few
+        // bytes instead; the caller checks the module list afterwards.
+        blog!("[bridge] remote thread still running — path buffer intentionally not freed");
+        return Err(format!("remote {fn_name} did not finish within {INJECT_WAIT_MS} ms"));
+    }
 
-    // LoadLibrary returns NULL (0) on failure, non-zero HMODULE on success
-    ok.is_ok() && exit_code != 0
+    unsafe { let _ = VirtualFreeEx(*h_proc, remote_mem, 0, MEM_RELEASE); }
+
+    if exit_code == 0 {
+        Err(format!("remote {fn_name} returned NULL (DLL failed to load in the target)"))
+    } else {
+        Ok(())
+    }
 }
 
 fn do_eject(pid: u32) -> Result<(), String> {
     let is64 = is_process_64bit(pid);
     let dll_name = speedpatch_dll(is64);
-
-    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) }
-        .map_err(|e| format!("CreateToolhelp32Snapshot: {e:?}"))?;
-
-    let mut me = MODULEENTRY32W { dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32, ..Default::default() };
-    let mut h_mod: Option<*mut std::ffi::c_void> = None;
-
-    unsafe {
-        if Module32FirstW(snap, &mut me).is_ok() {
-            loop {
-                let mod_name = String::from_utf16_lossy(&me.szModule)
-                    .trim_end_matches('\0').to_lowercase();
-                if mod_name == dll_name.to_lowercase() {
-                    h_mod = Some(me.hModule.0 as _);
-                    break;
-                }
-                if Module32NextW(snap, &mut me).is_err() { break; }
-            }
-        }
-    }
-    unsafe { let _ = CloseHandle(snap); }
-
-    let h_mod_ptr = h_mod.ok_or("module not found in target")?;
+    let h_mod_ptr = find_module(pid, dll_name).ok_or("module not found in target")?;
 
     let h_proc = unsafe {
         OpenProcess(
@@ -293,79 +385,91 @@ fn do_eject(pid: u32) -> Result<(), String> {
             Some(std::mem::transmute(free_lib)), Some(h_mod_ptr), 0, None)
     }.map_err(|e| format!("CreateRemoteThread: {e:?}"))?;
 
-    unsafe { WaitForSingleObject(h_thread, 5000); }
+    unsafe { WaitForSingleObject(h_thread, INJECT_WAIT_MS); }
     unsafe { let _ = CloseHandle(h_thread); let _ = CloseHandle(h_proc); }
     Ok(())
 }
 
+fn sp_is_enabled_by_id(pid: u32) -> Option<bool> {
+    let f = own_proc(b"SP_IsEnabledById\0")?;
+    let f: unsafe extern "C" fn(u32) -> BOOL = unsafe { std::mem::transmute(f) };
+    Some(unsafe { f(pid) }.as_bool())
+}
+
 fn do_enable(pid: u32) -> Result<(), String> {
-    eprintln!("[bridge] ENABLE pid={pid} dll={OWN_SPEEDPATCH}");
-    let dll_wide = to_wide(OWN_SPEEDPATCH);
-    unsafe {
-        let h = LoadLibraryW(PCWSTR::from_raw(dll_wide.as_ptr())).map_err(|e| format!("LoadLibraryW: {e:?}"))?;
-        eprintln!("[bridge] ENABLE LoadLibraryW ok h={h:?}");
+    blog!("[bridge] ENABLE pid={pid}");
+    let f = own_proc(b"SP_Enable\0").ok_or("SP_Enable not available (own DLL failed to load)")?;
+    let sp_enable: unsafe extern "C" fn(u32) = unsafe { std::mem::transmute(f) };
+    unsafe { sp_enable(pid) };
 
-        let sp_enable: Option<unsafe extern "C" fn(u32)> =
-            std::mem::transmute(GetProcAddress(h, s!("SP_Enable")));
-        eprintln!("[bridge] ENABLE GetProcAddress(SP_Enable) ok = {sp_enable:?}");
-        sp_enable.ok_or("GetProcAddress SP_Enable failed")?(pid);
-        eprintln!("[bridge] ENABLE SP_Enable({pid}) done");
+    // SP_Enable silently does nothing when the target has no speedpatch file
+    // mapping (DLL not actually loaded there). Read the flag back so that case
+    // becomes an error instead of a false "OK".
+    match sp_is_enabled_by_id(pid) {
+        Some(true) => {}
+        Some(false) => return Err("target has no active speedpatch (DLL not loaded in the game?)".into()),
+        None => blog!("[bridge] ENABLE pid={pid}: cannot read back status"),
+    }
 
-        // The DLL's hook-failure counter lives in a section shared between every
-        // process mapping it, so this read also surfaces failures recorded by the
-        // copy injected into the target — the difference between "speed control
-        // does nothing" and a game that crashes the moment it calls Sleep.
-        let failures: Option<unsafe extern "C" fn() -> u32> =
-            std::mem::transmute(GetProcAddress(h, s!("SP_GetHookFailures")));
-        if let Some(f) = failures {
-            let n = f();
-            if n > 0 {
-                eprintln!("[bridge] WARNING: {n} time-API hook(s) not installed — those APIs stay unpatched");
-            } else {
-                eprintln!("[bridge] all time-API hooks installed");
-            }
+    // Shared failure counter — see speedpatch.h. It also counts failures of
+    // other processes that loaded the DLL, so it is a hint, not a verdict.
+    if let Some(f) = own_proc(b"SP_GetHookFailures\0") {
+        let failures: unsafe extern "C" fn() -> u32 = unsafe { std::mem::transmute(f) };
+        let n = unsafe { failures() };
+        if n > 0 {
+            blog!("[bridge] WARNING: {n} time-API hook(s) not installed (in some process) — those APIs stay unpatched");
+        } else {
+            blog!("[bridge] all time-API hooks installed");
         }
     }
+    blog!("[bridge] ENABLE pid={pid} ok");
     Ok(())
 }
 
 fn do_disable(pid: u32) -> Result<(), String> {
-    eprintln!("[bridge] DISABLE pid={pid} dll={OWN_SPEEDPATCH}");
-    let dll_wide = to_wide(OWN_SPEEDPATCH);
-    unsafe {
-        let h = LoadLibraryW(PCWSTR::from_raw(dll_wide.as_ptr())).map_err(|e| format!("LoadLibraryW: {e:?}"))?;
-        eprintln!("[bridge] DISABLE LoadLibraryW ok h={h:?}");
-        let sp_disable: Option<unsafe extern "C" fn(u32)> =
-            std::mem::transmute(GetProcAddress(h, s!("SP_Disable")));
-        eprintln!("[bridge] DISABLE GetProcAddress(SP_Disable) ok = {sp_disable:?}");
-        sp_disable.ok_or("GetProcAddress SP_Disable failed")?(pid);
-        eprintln!("[bridge] DISABLE SP_Disable({pid}) done");
-    }
+    blog!("[bridge] DISABLE pid={pid}");
+    let f = own_proc(b"SP_Disable\0").ok_or("SP_Disable not available (own DLL failed to load)")?;
+    let sp_disable: unsafe extern "C" fn(u32) = unsafe { std::mem::transmute(f) };
+    unsafe { sp_disable(pid) };
     Ok(())
 }
 
 fn do_is_enabled(_pid: u32) -> Result<bool, String> {
-    // Always report as enabled — SP_IsEnabledById is unreliable on 32-bit
+    // Kept for protocol compatibility; STATUS is the reliable query.
     Ok(true)
 }
 
-fn do_set_speed(factor: f64) {
-    let dll_wide = to_wide(OWN_SPEEDPATCH);
-    unsafe {
-        let Ok(h) = LoadLibraryW(PCWSTR::from_raw(dll_wide.as_ptr())) else { return };
-        let set_speed: Option<unsafe extern "C" fn(f64)> =
-            std::mem::transmute(GetProcAddress(h, s!("SP_SetSpeed")));
-        if let Some(f) = set_speed { f(factor); }
+/// STATUS <pid> → "OK ENABLED" | "OK DISABLED" | "OK NOTINJECTED"
+fn do_status(pid: u32) -> String {
+    let is64 = is_process_64bit(pid);
+    if find_module(pid, speedpatch_dll(is64)).is_none() {
+        return "OK NOTINJECTED".into();
+    }
+    match sp_is_enabled_by_id(pid) {
+        Some(true) => "OK ENABLED".into(),
+        Some(false) => "OK DISABLED".into(),
+        None => "ERROR status unavailable".into(),
     }
 }
 
+fn do_set_speed(factor: f64) -> Result<(), String> {
+    if !(factor > 0.0) || !factor.is_finite() {
+        return Err(format!("invalid speed factor {factor}"));
+    }
+    let f = own_proc(b"SP_SetSpeed\0").ok_or("SP_SetSpeed not available (own DLL failed to load)")?;
+    let set_speed: unsafe extern "C" fn(f64) = unsafe { std::mem::transmute(f) };
+    unsafe { set_speed(factor) };
+    blog!("[bridge] SETSPEED {factor}");
+    Ok(())
+}
+
 fn do_get_speed() -> f64 {
-    let dll_wide = to_wide(OWN_SPEEDPATCH);
-    unsafe {
-        let Ok(h) = LoadLibraryW(PCWSTR::from_raw(dll_wide.as_ptr())) else { return 1.0 };
-        let get_speed: Option<unsafe extern "C" fn() -> f64> =
-            std::mem::transmute(GetProcAddress(h, s!("SP_GetSpeed")));
-        if let Some(f) = get_speed { f() } else { 1.0 }
+    match own_proc(b"SP_GetSpeed\0") {
+        Some(f) => {
+            let get_speed: unsafe extern "C" fn() -> f64 = unsafe { std::mem::transmute(f) };
+            unsafe { get_speed() }
+        }
+        None => 1.0,
     }
 }
 
@@ -401,14 +505,16 @@ fn handle_command(line: &str) -> String {
         }
         "SETSPEED" => {
             let f: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-            do_set_speed(f);
-            "OK".into()
+            match do_set_speed(f) { Ok(()) => "OK".into(), Err(e) => format!("ERROR {e}") }
         }
         "GETSPEED" => {
             let s = do_get_speed();
             format!("OK {s:.6}")
         }
-        "STATUS" => "OK".into(),
+        "STATUS" => {
+            let pid: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            do_status(pid)
+        }
         "SHUTDOWN" => "OK shutting down".into(),
         _ => "ERROR unknown command".into(),
     }
@@ -476,6 +582,10 @@ fn pipe_server() {
 
 fn main() {
     install_crash_handler();
+    blog!("[bridge] ---- {} starting (pid {}) ----", PIPE_NAME, std::process::id());
+    // Load our own copy of the DLL up front and switch speed control off for
+    // the bridge process itself (see own_dll()).
+    let _ = own_dll();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
