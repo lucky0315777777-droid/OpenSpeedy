@@ -17,6 +17,7 @@ static BRIDGE_CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 /// Ctrl+C handler — ensures bridge processes are killed when the user
 /// presses Ctrl+C in the terminal (debug mode / running from console).
 unsafe extern "system" fn ctrlc_handler(_ctrl_type: u32) -> BOOL {
+    disable_all_enabled();
     shutdown_bridges();
     std::process::exit(0);
 }
@@ -49,7 +50,13 @@ fn ensure_bridges() {
             applog::warn("bridge", format!("{name} not found at {} — skipped", path.display()));
             continue;
         }
-        let stderr = std::fs::File::create(&log_path)
+        // Append instead of truncating: the old behaviour wiped the previous
+        // session's bridge log on every start, which is exactly the session
+        // you need after "it stopped working".
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
             .map(std::process::Stdio::from)
             .unwrap_or_else(|e| {
                 applog::warn("bridge", format!("cannot create {}: {e}", log_path.display()));
@@ -157,6 +164,10 @@ async fn bridge32_health() -> bool {
 async fn bridge_set_speed(factor: f64) -> bool {
     let a = bridge_client::bridge64_set_speed(factor);
     let b = bridge_client::bridge32_set_speed(factor);
+    applog::info("process-control", format!(
+        "SETSPEED {factor}: x64 {} / x86 {}",
+        if a { "OK" } else { "FAILED" }, if b { "OK" } else { "FAILED" }
+    ));
     a || b
 }
 
@@ -170,35 +181,70 @@ async fn get_system_stats() -> system_stats::SystemStats {
     system_stats::get_system_stats()
 }
 
+/// PIDs this session has enabled, with their arch, so they can be switched
+/// back to normal speed when OpenSpeedy exits. Upstream only killed the bridges
+/// on exit, leaving the game running at the last speed with no UI to stop it.
+static ENABLED_PIDS: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+
+fn track_enabled(pid: u32, arch: &str, on: bool) {
+    let mut v = match ENABLED_PIDS.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    v.retain(|(p, _)| *p != pid);
+    if on { v.push((pid, arch.to_string())); }
+}
+
+fn disable_all_enabled() {
+    let list: Vec<(u32, String)> = match ENABLED_PIDS.lock() {
+        Ok(mut g) => g.drain(..).collect(),
+        Err(p) => p.into_inner().drain(..).collect(),
+    };
+    for (pid, arch) in list {
+        let ok = if arch == "x86" { bridge_client::bridge32_disable(pid) } else { bridge_client::bridge64_disable(pid) };
+        applog::info("process-control", format!("exit: DISABLE {pid} [{arch}]: {}", if ok { "OK" } else { "FAILED (process gone?)" }));
+    }
+}
+
+/// Inject + enable. Returns true only when BOTH steps succeeded — upstream
+/// returned the inject result alone and ignored ENABLE, and the UI ignored even
+/// that, so a failed attempt still showed as "on" and was never retried.
 #[tauri::command(async)]
 async fn bridge_inject(pid: u32, arch: String) -> bool {
-    if arch == "x86" {
-        let ok = bridge_client::bridge32_inject(pid);
-        bridge_client::bridge32_enable(pid);
-        ok
+    let (inj, en) = if arch == "x86" {
+        let inj = bridge_client::bridge32_inject(pid);
+        (inj, inj && bridge_client::bridge32_enable(pid))
     } else {
-        let ok = bridge_client::bridge64_inject(pid);
-        bridge_client::bridge64_enable(pid);
-        ok
+        let inj = bridge_client::bridge64_inject(pid);
+        (inj, inj && bridge_client::bridge64_enable(pid))
+    };
+    applog::info("process-control", format!("INJECT {pid} [{arch}]: {}", if inj { "OK" } else { "FAILED" }));
+    if inj {
+        applog::info("process-control", format!("ENABLE {pid} [{arch}]: {}", if en { "OK" } else { "FAILED" }));
     }
+    track_enabled(pid, &arch, en);
+    en
 }
 
 #[tauri::command(async)]
 async fn bridge_enable(pid: u32, arch: String) -> bool {
-    if arch == "x86" {
+    let ok = if arch == "x86" {
         bridge_client::bridge32_enable(pid)
     } else {
         bridge_client::bridge64_enable(pid)
-    }
+    };
+    applog::info("process-control", format!("ENABLE {pid} [{arch}]: {}", if ok { "OK" } else { "FAILED" }));
+    track_enabled(pid, &arch, ok);
+    ok
 }
 
 #[tauri::command(async)]
 async fn bridge_disable(pid: u32, arch: String) -> bool {
-    if arch == "x86" {
+    let ok = if arch == "x86" {
         bridge_client::bridge32_disable(pid)
     } else {
         bridge_client::bridge64_disable(pid)
-    }
+    };
+    applog::info("process-control", format!("DISABLE {pid} [{arch}]: {}", if ok { "OK" } else { "FAILED" }));
+    track_enabled(pid, &arch, false);
+    ok
 }
 
 /// Query bridge for per-PID status.
@@ -282,7 +328,9 @@ pub fn run() -> Result<(), String> {
 
     app.run(|_app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            applog::info("shutdown", "exit requested, stopping bridges");
+            applog::info("shutdown", "exit requested, restoring normal speed in enabled games");
+            disable_all_enabled();
+            applog::info("shutdown", "stopping bridges");
             shutdown_bridges();
         }
     });
